@@ -10,7 +10,7 @@ app.use(express.json());
    HEALTH CHECK
 ========================= */
 app.get("/", (req, res) => {
-  res.send("SafeMeds API running (production version)");
+  res.send("SafeMeds API running (fixed production version)");
 });
 
 /* =========================
@@ -36,7 +36,7 @@ function detectIntent(text = "") {
 }
 
 /* =========================
-   DRUG CLEANING
+   CLEAN DRUG NAME
 ========================= */
 function cleanDrugName(raw = "") {
   return raw
@@ -61,20 +61,14 @@ function getHelpMessage() {
   return {
     type: "help",
     message: `
-👋 SafeMeds AI Assistant
+👋 SafeMeds AI
 
-I can analyze prescription medications using FDA + NIH databases.
-
-✔ Try typing a medication name:
-- metformin
-- ibuprofen
-- lisinopril
-- Adderall
-- Kombiglyze XR
-
-❌ I cannot process general chat messages.
-
-Please enter a drug name to continue.
+Enter a medication name to get:
+- Uses
+- Side effects
+- Warnings
+- Interactions
+- Research data
     `
   };
 }
@@ -87,6 +81,7 @@ async function getRxNorm(drug) {
     const res = await fetch(
       `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(drug)}`
     );
+
     const data = await res.json();
 
     return data?.drugGroup?.conceptGroup
@@ -214,7 +209,7 @@ function calculateRisk(fda = "", faers = "") {
 }
 
 /* =========================
-   MAIN ROUTE
+   MAIN ROUTE (FIXED)
 ========================= */
 app.post("/drug", async (req, res) => {
 
@@ -232,7 +227,7 @@ app.post("/drug", async (req, res) => {
 
   try {
 
-    /* STEP 1: RXNORM */
+    /* ================= RXNORM ================= */
     const rx = await getRxNorm(query);
 
     const rawName = rx?.name || query;
@@ -242,50 +237,65 @@ app.post("/drug", async (req, res) => {
     if (!primaryDrug) {
       return res.json({
         type: "error",
-        message: "Please enter a valid medication name."
+        message: "Invalid medication name."
       });
     }
 
-    /* STEP 2: DATA SOURCES */
+    /* ================= DATA SOURCES ================= */
     const fda = await getFDA(primaryDrug);
     const faers = await getFAERS(primaryDrug);
     const interactions = await getInteractions(rx?.rxcui);
     const pubmedCount = await getPubMedCount(primaryDrug);
 
-    /* STEP 3: INTERACTIONS TEXT */
+    /* ================= SAFE FDA FIELDS ================= */
+    const summary =
+      fda?.indications_and_usage?.[0] ||
+      fda?.description?.[0] ||
+      `No official summary available for ${primaryDrug}.`;
+
+    const warnings =
+      fda?.warnings?.[0] ||
+      fda?.boxed_warning?.[0] ||
+      "No FDA warnings available.";
+
+    const sideEffects =
+      fda?.adverse_reactions?.[0] ||
+      "No FDA side effect data available.";
+
+    /* ================= INTERACTIONS ================= */
     let interactionText = "No interaction data available.";
 
     try {
-      const desc = interactions?.[0]?.interactionPair?.[0]?.description;
-      if (desc) interactionText = desc.slice(0, 500);
+      const desc =
+        interactions?.[0]?.interactionPair?.[0]?.description;
+
+      if (desc) {
+        interactionText = desc.slice(0, 600);
+      }
     } catch {}
 
-    /* STEP 4: FAERS TEXT */
+    /* ================= FAERS ================= */
     const faersText =
       faers.length > 0
         ? parseFAERS(faers).join(", ")
-        : "No FAERS reports found.";
+        : "No adverse event reports found.";
 
-    /* STEP 5: RISK */
-    const risk = calculateRisk(
-      fda?.warnings?.[0] || "",
-      faersText
-    );
+    /* ================= RISK ================= */
+    const risk = calculateRisk(warnings, faersText);
 
-    /* FINAL RESPONSE */
+    /* ================= FINAL RESPONSE ================= */
     return res.json({
       type: "drug_info",
       data: {
         drug: primaryDrug,
         rxcui: rx?.rxcui || null,
 
-        fda_indications: fda?.indications_and_usage?.[0] || null,
-        warnings: fda?.warnings?.[0] || null,
-        side_effects: fda?.adverse_reactions?.[0] || null,
-
+        summary,
+        warnings,
+        side_effects: sideEffects,
         interactions: interactionText,
-        faers: faersText,
 
+        faers: faersText,
         pubmed_count: pubmedCount,
         risk_level: risk
       }
