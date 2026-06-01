@@ -10,8 +10,29 @@ app.use(express.json());
    HEALTH CHECK
 ========================= */
 app.get("/", (req, res) => {
-  res.send("SafeMeds API running with FAERS integration");
+  res.send("SafeMeds API running (clean production version)");
 });
+
+/* =========================
+   DRUG CLEANING (IMPORTANT FIX)
+========================= */
+
+function cleanDrugName(raw = "") {
+  return raw
+    .replace(/\[.*?\]/g, "")                 // remove [Kombiglyze]
+    .replace(/\d+(\.\d+)?\s*mg/gi, "")       // remove dosages
+    .replace(/\b(extended release|er|tablet|capsule|oral|solution)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Split combo drugs into ingredients
+function splitDrugs(name = "") {
+  return name
+    .split(/\/|,/)
+    .map(cleanDrugName)
+    .filter(Boolean);
+}
 
 /* =========================
    RXNORM
@@ -21,6 +42,7 @@ async function getRxNorm(drug) {
     const res = await fetch(
       `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(drug)}`
     );
+
     const data = await res.json();
 
     return data?.drugGroup?.conceptGroup
@@ -33,13 +55,14 @@ async function getRxNorm(drug) {
 }
 
 /* =========================
-   OPENFDA LABEL
+   FDA LABEL (openFDA)
 ========================= */
 async function getFDA(drug) {
   try {
-    const res = await fetch(
-      `https://api.fda.gov/drug/label.json?search=openfda.generic_name:"${drug}"&limit=1`
-    );
+    const url =
+      `https://api.fda.gov/drug/label.json?search=openfda.generic_name:"${drug}"&limit=1`;
+
+    const res = await fetch(url);
 
     if (!res.ok) return null;
 
@@ -48,6 +71,27 @@ async function getFDA(drug) {
 
   } catch {
     return null;
+  }
+}
+
+/* =========================
+   FAERS (REAL WORLD REPORTS)
+========================= */
+async function getFAERS(drug) {
+  try {
+    const url =
+      `https://api.fda.gov/drug/event.json?search=patient.drug.medicinalproduct:"${drug}"&limit=10`;
+
+    const res = await fetch(url);
+
+    if (!res.ok) return [];
+
+    const data = await res.json();
+
+    return data?.results || [];
+
+  } catch {
+    return [];
   }
 }
 
@@ -67,27 +111,6 @@ async function getInteractions(rxcui) {
 
   } catch {
     return null;
-  }
-}
-
-/* =========================
-   ⭐ FAERS (SIMPLIFIED & SAFE)
-========================= */
-async function getFAERS(drug) {
-  try {
-    const url =
-      `https://api.fda.gov/drug/event.json?search=patient.drug.medicinalproduct:"${drug}"&limit=10`;
-
-    const res = await fetch(url);
-
-    if (!res.ok) return [];
-
-    const data = await res.json();
-
-    return data?.results || [];
-
-  } catch {
-    return [];
   }
 }
 
@@ -123,23 +146,31 @@ app.post("/drug", async (req, res) => {
 
   try {
 
-    /* STEP 1: RXNORM */
+    /* =========================
+       STEP 1: RXNORM
+    ========================= */
     const rx = await getRxNorm(query);
 
-    if (!rx) {
+    const rawName = rx?.name || query;
+
+    const drugs = splitDrugs(rawName);
+    const primaryDrug = drugs[0];
+
+    if (!primaryDrug) {
       return res.json({
-        answer: "Medication not found. Try a generic or brand name."
+        answer: "Medication not found. Try a simpler name like 'metformin'."
       });
     }
 
-    const drugName = rx.name;
-    const rxcui = rx.rxcui;
+    /* =========================
+       STEP 2: FDA
+    ========================= */
+    const fda = await getFDA(primaryDrug);
 
-    /* STEP 2: FDA */
-    const fda = await getFDA(drugName);
-
-    /* STEP 3: INTERACTIONS */
-    const interactions = await getInteractions(rxcui);
+    /* =========================
+       STEP 3: INTERACTIONS
+    ========================= */
+    const interactions = await getInteractions(rx?.rxcui);
 
     let interactionText = "No interaction data available.";
 
@@ -154,39 +185,40 @@ app.post("/drug", async (req, res) => {
     } catch {}
 
     /* =========================
-       ⭐ FAERS PROCESSING (FIXED)
+       STEP 4: FAERS
     ========================= */
-    const faers = await getFAERS(drugName);
+    const faers = await getFAERS(primaryDrug);
 
-    let faersText = "No FAERS reports available.";
+    let faersText = "No FAERS reports found.";
 
     if (faers.length > 0) {
 
-      const reactions = faers
+      const events = faers
         .flatMap(r => r?.patient?.reaction || [])
         .map(r => r?.reactionmeddrapt)
         .filter(Boolean);
 
-      const unique = [...new Set(reactions)].slice(0, 8);
+      const unique = [...new Set(events)].slice(0, 8);
 
       faersText =
         unique.length > 0
           ? `Reported adverse events: ${unique.join(", ")}`
-          : "FAERS data exists but no readable event names found.";
+          : "FAERS data exists but no readable events found.";
     }
 
-    /* STEP 4: PUBMED */
-    const pubmedCount = await getPubMedCount(drugName);
+    /* =========================
+       STEP 5: PUBMED
+    ========================= */
+    const pubmedCount = await getPubMedCount(primaryDrug);
 
     /* =========================
        RESPONSE
     ========================= */
-
     const answer = `
 ⚕️ SAFE MEDS (INFORMATION ONLY — NOT MEDICAL ADVICE)
 
-Drug: ${drugName}
-RxCUI: ${rxcui}
+Drug: ${primaryDrug}
+RxCUI: ${rx?.rxcui || "N/A"}
 
 --- FDA INDICATIONS ---
 ${fda?.indications_and_usage?.[0]?.slice(0, 500) || "Not available"}
@@ -197,7 +229,7 @@ ${fda?.warnings?.[0]?.slice(0, 500) || "Not available"}
 --- COMMON SIDE EFFECTS ---
 ${fda?.adverse_reactions?.[0]?.slice(0, 500) || "Not available"}
 
---- ⚠️ REAL-WORLD REPORTS (FAERS) ---
+--- ⚠️ FAERS (REAL-WORLD REPORTS) ---
 ${faersText}
 
 --- DRUG INTERACTIONS ---
