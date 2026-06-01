@@ -3,105 +3,185 @@ import cors from "cors";
 
 const app = express();
 
-// REQUIRED for Squarespace frontend requests
 app.use(cors());
 app.use(express.json());
 
-// Health check route (test in browser)
+/* =========================
+   HEALTH CHECK
+========================= */
 app.get("/", (req, res) => {
-  res.send("Drug API is running");
+  res.send("SafeMeds API running");
 });
 
-// MAIN DRUG ENDPOINT
+/* =========================
+   HELPERS
+========================= */
+
+// Normalize drug name → RxNorm
+async function getRxNorm(drug) {
+  try {
+    const res = await fetch(
+      `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(drug)}`
+    );
+
+    const data = await res.json();
+
+    return data?.drugGroup?.conceptGroup
+      ?.find(g => g.conceptProperties)
+      ?.conceptProperties?.[0] || null;
+
+  } catch {
+    return null;
+  }
+}
+
+// FDA label info
+async function getFDA(drug) {
+  try {
+    const res = await fetch(
+      `https://api.fda.gov/drug/label.json?search=openfda.generic_name:"${drug}"&limit=1`
+    );
+
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    return data?.results?.[0] || null;
+
+  } catch {
+    return null;
+  }
+}
+
+// Drug interactions
+async function getInteractions(rxcui) {
+  try {
+    const res = await fetch(
+      `https://rxnav.nlm.nih.gov/REST/interaction/interaction.json?rxcui=${rxcui}`
+    );
+
+    const data = await res.json();
+
+    return data?.fullInteractionTypeGroup?.[0]
+      ?.fullInteractionType || null;
+
+  } catch {
+    return null;
+  }
+}
+
+// PubMed research count
+async function getPubMedCount(drug) {
+  try {
+    const res = await fetch(
+      `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(drug)}&retmode=json`
+    );
+
+    const data = await res.json();
+
+    return data?.esearchresult?.count || "0";
+
+  } catch {
+    return "0";
+  }
+}
+
+/* =========================
+   MAIN ROUTE
+========================= */
+
 app.post("/drug", async (req, res) => {
+
   const query = req.body.query;
 
   if (!query) {
     return res.json({
-      answer: "No drug query provided."
+      answer: "Please enter a medication name."
     });
   }
 
   try {
-    // -----------------------------
-    // 1. openFDA lookup (basic label search)
-    // -----------------------------
-    const fdaUrl = `https://api.fda.gov/drug/label.json?search=generic_name:"${query}"&limit=1`;
 
-    const fdaRes = await fetch(fdaUrl);
-    const fdaData = await fdaRes.json();
+    /* STEP 1: RXNORM */
+    const rx = await getRxNorm(query);
 
-    if (fdaData.results && fdaData.results.length > 0) {
-      const drug = fdaData.results[0];
-
+    if (!rx) {
       return res.json({
-        answer: `
-DRUG INFORMATION (FDA SOURCE)
-
-Name: ${drug.openfda?.brand_name?.[0] || query}
-
-Indications:
-${drug.indications_and_usage?.[0]?.slice(0, 400) || "Not available"}
-
-Warnings:
-${drug.warnings?.[0]?.slice(0, 400) || "Not available"}
-
-Side Effects:
-${drug.adverse_reactions?.[0]?.slice(0, 400) || "Not available"}
-
-Source: openFDA
-        `
+        answer: "Medication not found. Try a generic or brand name (e.g., ibuprofen, Tylenol)."
       });
     }
 
-    // -----------------------------
-    // 2. RxNorm fallback lookup
-    // -----------------------------
-    const rxUrl = `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(query)}`;
+    const drugName = rx.name;
+    const rxcui = rx.rxcui;
 
-    const rxRes = await fetch(rxUrl);
-    const rxData = await rxRes.json();
+    /* STEP 2: FDA DATA */
+    const fda = await getFDA(drugName);
 
-    const concept =
-      rxData?.drugGroup?.conceptGroup?.find(g => g.conceptProperties)
-        ?.conceptProperties?.[0];
+    /* STEP 3: INTERACTIONS */
+    const interactions = await getInteractions(rxcui);
 
-    if (concept) {
-      return res.json({
-        answer: `
-DRUG FOUND (NIH RXNORM)
+    let interactionText = "No interaction data found.";
 
-Name: ${concept.name}
-RxCUI: ${concept.rxcui}
+    try {
+      const first =
+        interactions?.[0]
+          ?.interactionPair?.[0]
+          ?.description;
 
-Source: National Library of Medicine
-        `
-      });
-    }
+      if (first) {
+        interactionText = first.slice(0, 500);
+      }
+    } catch {}
 
-    // -----------------------------
-    // 3. No match found
-    // -----------------------------
+    /* STEP 4: PUBMED */
+    const pubmedCount = await getPubMedCount(drugName);
+
+    /* =========================
+       RESPONSE
+    ========================= */
+
+    const answer = `
+⚕️ SAFE MEDS INFORMATION (NOT MEDICAL ADVICE)
+
+Drug: ${drugName}
+RxCUI: ${rxcui}
+
+--- USES ---
+${fda?.indications_and_usage?.[0]?.slice(0, 500) || "Not available"}
+
+--- WARNINGS ---
+${fda?.warnings?.[0]?.slice(0, 500) || "Not available"}
+
+--- SIDE EFFECTS ---
+${fda?.adverse_reactions?.[0]?.slice(0, 500) || "Not available"}
+
+--- INTERACTIONS ---
+${interactionText}
+
+--- RESEARCH ---
+${pubmedCount} PubMed studies indexed
+
+--- SOURCES ---
+RxNorm | openFDA | RxNav | PubMed
+`;
+
+    return res.json({ answer });
+
+  } catch (err) {
+
+    console.error(err);
+
     return res.json({
-      answer: `
-No matching drug found.
-
-Try:
-- Generic name (ibuprofen)
-- Brand name (Advil, Tylenol, Metformin)
-      `
-    });
-
-  } catch (error) {
-    return res.json({
-      answer: "Error accessing drug databases. Please try again later."
+      answer: "Server error retrieving medication data."
     });
   }
 });
 
-// Start server (Render sets PORT automatically)
+/* =========================
+   START SERVER
+========================= */
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log("Drug API running on port", PORT);
-});
+  console.log(`SafeMeds running on port ${PORT}`);
+})
