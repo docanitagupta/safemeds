@@ -1,5 +1,5 @@
 {
-  "name": "drug-backend",
+  "name": "safemeds-api",
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
